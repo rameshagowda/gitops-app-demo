@@ -1,0 +1,123 @@
+name: CI pipeline
+env:
+  IMAGE_NAME: 'demoapp'  
+on:
+  push:
+    branches: 
+      - "**"
+permissions:
+  id-token: write # This is required for requesting the JWT
+  contents: read  # This is required for actions/checkout
+jobs:
+  Setup_Job:
+    runs-on: ubuntu-latest
+    outputs:      
+      ver: ${{ steps.getvariable.outputs.ver }}
+    steps:
+    - name: Use repository
+      uses: actions/checkout@v3
+    - name: Build variables
+      id: getvariable
+      run: |        
+        echo "ver=dev_$(date +'%Y%m%d')_$(git rev-parse --short ${{ github.sha }})" >> $GITHUB_OUTPUT        
+    - name: Upload repository
+      uses: actions/upload-artifact@v3
+      with:
+        name: repository
+        path: |
+          ${{ github.workspace }}/Dockerfile
+          ${{ github.workspace }}/.dockerignore
+          ${{ github.workspace }}/main.go
+          ${{ github.workspace }}/main_test.go 
+  Get_ACR_Name:
+    runs-on: ubuntu-latest
+    needs: [Setup_Job]
+    outputs:
+      acrname: ${{ steps.getacrname.outputs.acrname }}
+      rgname: ${{ steps.getacrname.outputs.rgname }}
+    steps:
+    - name: Use repository
+      uses: actions/checkout@v3
+      with:
+        repository: ${{ github.repository_owner }}/gitops-argocd-demo
+        ref: main
+        token: ${{ secrets.ACTIONS_TOKEN }}
+    - name: Get ACR Name
+      id: getacrname
+      run: |        
+        echo "acrname=$(cat helm/demo-app/dynamic/acr-dev)" >> $GITHUB_OUTPUT
+        echo "rgname=$(cat global/rg-dev)" >> $GITHUB_OUTPUT                
+  Test_Push:
+    needs: Setup_Job
+    runs-on: ubuntu-latest
+    steps:
+    - name: Use Golang 1.17
+      uses: actions/setup-go@v3
+      with:
+       go-version: 1.17
+    - name: Download repository
+      uses: actions/download-artifact@v3
+      with:
+        name: repository
+    - name: Run tests
+      run: |
+        go env -w GO111MODULE=off
+        go test -v -race -timeout=180s -count=1 -cover ./...
+  Image_Analyze:
+    runs-on: ubuntu-latest    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+    - name: Build an image from Dockerfile
+      run: |
+        docker build -t scanimage:${{ github.sha }} .
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: 'scanimage:${{ github.sha }}'
+        format: 'table'
+        exit-code: '1'
+        ignore-unfixed: true
+        vuln-type: 'os,library'
+        severity: 'CRITICAL,HIGH'   
+  Docker_Build_Push:
+    needs: [Setup_Job, Test_Push, Get_ACR_Name, Image_Analyze]
+    runs-on: ubuntu-latest
+    environment: 
+      name: ${{ needs.Setup_Job.outputs.output_env }}  
+    steps:
+    - name: Download repository
+      uses: actions/download-artifact@v3
+      with:
+        name: repository
+    - name: 'Az CLI login'
+      uses: azure/login@v1
+      with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+    - name: Azure CLI script
+      uses: azure/CLI@v1
+      with:
+        azcliversion: 2.30.0
+        inlineScript: |
+          az configure --defaults acr=${{ needs.Get_ACR_Name.outputs.acrname }}          
+          az acr build -t ${{ needs.Get_ACR_Name.outputs.acrname }}/${{ env.IMAGE_NAME }}:${{ needs.Setup_Job.outputs.ver }} -g ${{ needs.Get_ACR_Name.outputs.rgname }} -r ${{ needs.Get_ACR_Name.outputs.acrname }} . --build-arg VER=${{ needs.Setup_Job.outputs.ver }}            
+          az acr build -t ${{ needs.Get_ACR_Name.outputs.acrname }}/${{ env.IMAGE_NAME }}:latest -g ${{ needs.Get_ACR_Name.outputs.rgname }} -r ${{ needs.Get_ACR_Name.outputs.acrname }} . --build-arg VER=latest                                 
+  UpdateArgoCDAppConfig:
+    needs: [Setup_Job, Docker_Build_Push]
+    runs-on: ubuntu-latest
+    steps:
+    - name: Use config repository
+      uses: actions/checkout@v3
+      with:
+        repository: ${{ github.repository_owner }}/gitops-argocd-demo
+        ref: main
+        token: ${{ secrets.ACTIONS_TOKEN }}
+    - name: Push commit hash to IaC repository
+      run: |        
+        git config user.name $(git log -n 1 --pretty=format:%an)
+        git config user.email $(git log -n 1 --pretty=format:%ae)        
+        echo ${{ needs.Setup_Job.outputs.ver }} > helm/demo-app/dynamic/tag-dev
+        git commit helm/demo-app/dynamic/tag-dev -m "demoapp dev ${{ needs.Setup_Job.outputs.ver }}"        
+        git push origin HEAD
