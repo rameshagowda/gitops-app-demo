@@ -2,6 +2,7 @@ name: CI pipeline
 env:
   IMAGE_NAME: 'demoapp'  
 on:
+  workflow_dispatch:
   push:
     branches: 
       - "**"
